@@ -1,0 +1,158 @@
+---
+name: image-build
+
+on:
+  workflow_call:
+    inputs:
+      # Push ghcr.io/<owner>/<image> with its tags and prune old versions.
+      push:
+        type: boolean
+        default: false
+      # auto: the images the pull request or push changed. all: every image.
+      mode:
+        type: string
+        default: auto
+      # Directory holding one subdirectory per image; "." for the top level.
+      directory:
+        type: string
+        default: images
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    timeout-minutes: 5
+    runs-on: ${{ vars.PRIVATE_RUNNER }}
+    outputs:
+      images: ${{ steps.select.outputs.images }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Select the images this run builds
+        id: select
+        env:
+          MODE: ${{ inputs.mode }}
+          DIRECTORY: ${{ inputs.directory }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          prefix="${DIRECTORY%/}/"
+          if [ "${prefix}" = ./ ]; then prefix=""; fi
+          all=$(for file in "${prefix}"*/Containerfile; do
+                  if [ -f "${file}" ]; then basename "$(dirname "${file}")"; fi
+                done | jq -Rcs 'split("\n") | map(select(length > 0))')
+          if [ "${MODE}" = all ] || [ -z "${BASE}" ] || [ "${BASE}" = 0000000000000000000000000000000000000000 ]; then
+            images=${all}
+          else
+            images='[]'
+            while IFS= read -r file; do
+              if [[ ${file} == "${prefix}"* ]] && [[ ${file#"${prefix}"} =~ ^([^/]+)/ ]]; then
+                images=$(jq -c --arg image "${BASH_REMATCH[1]}" '. + [$image] | unique' <<< "${images}")
+              elif [ "${file}" = .hadolint.yaml ]; then
+                images=${all}
+                break
+              fi
+            done < <(git diff --name-only "${BASE}...${HEAD}")
+            images=$(jq -c --argjson all "${all}" '[.[] | select(. as $image | $all | index($image))]' <<< "${images}")
+          fi
+          echo "images=${images}" >> "${GITHUB_OUTPUT}"
+          echo "images: ${images}"
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.images != '[]'
+    timeout-minutes: 60
+    runs-on: ${{ vars.PRIVATE_RUNNER }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.changes.outputs.images) }}
+    env:
+      DIR: ${{ inputs.directory == '.' && matrix.image || format('{0}/{1}', inputs.directory, matrix.image) }}
+      REF: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in to the registry
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "${TOKEN}" | docker login ghcr.io --username "${ACTOR}" --password-stdin
+      - name: Lint the Containerfile
+        env:
+          HADOLINT: ghcr.io/${{ github.repository_owner }}/hadolint@sha256:3695882bc1e6e5bd6bb40d11a771936bb5873286e5ee4b5a1874e61acf4139ec # stable
+        run: >-
+          docker run --rm --interactive --volume "${PWD}/.hadolint.yaml:/hadolint.yaml:ro"
+          "${HADOLINT}" --config /hadolint.yaml - < "${DIR}/Containerfile"
+      - name: Connect to the cluster's rootless BuildKit
+        run: >-
+          docker buildx create --name ci --use --driver remote
+          --driver-opt "cacert=${HOME}/.buildkit/ca.crt,cert=${HOME}/.buildkit/tls.crt,key=${HOME}/.buildkit/tls.key,servername=buildkitd.buildkit.svc"
+          "${BUILDKIT_HOST}"
+      - name: Build
+        run: >-
+          docker buildx build --file "${DIR}/Containerfile"
+          --output "type=docker,dest=${RUNNER_TEMP}/image.tar" --tag "${REF}:stable"
+          "${DIR}"
+      - name: Load and test
+        id: test
+        run: |
+          set -euo pipefail
+          docker load --input "${RUNNER_TEMP}/image.tar"
+          "${DIR}/test.sh" "${REF}:stable" | tee "${RUNNER_TEMP}/test.log"
+          version=$(sed -n 's/^version=//p' "${RUNNER_TEMP}/test.log" | tail -n 1)
+          if [ -n "${version}" ] && ! [[ ${version} =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "::error::test.sh printed version=${version}, expected digits and dots"
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+      - name: Scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          input: ${{ runner.temp }}/image.tar
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          cache-dir: ${{ runner.temp }}/trivy
+      - name: SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          input: ${{ runner.temp }}/image.tar
+          format: spdx-json
+          output: ${{ runner.temp }}/sbom.spdx.json
+          cache-dir: ${{ runner.temp }}/trivy
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-${{ matrix.image }}
+          path: ${{ runner.temp }}/sbom.spdx.json
+      - name: Push
+        if: inputs.push
+        env:
+          VERSION: ${{ steps.test.outputs.version }}
+        run: |
+          set -euo pipefail
+          build="${VERSION:+${VERSION}-}$(date -u +%Y%m%d%H%M%S)"
+          tags=(stable "${build}")
+          if [ -n "${VERSION}" ]; then
+            tags+=("${VERSION}")
+          fi
+          for tag in "${tags[@]}"; do
+            docker tag "${REF}:stable" "${REF}:${tag}"
+            docker push "${REF}:${tag}"
+          done
+          echo "::notice::${REF}: ${tags[*]}"
+      - name: Keep stable and the two versions before it
+        if: inputs.push
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5.0.0
+        with:
+          package-name: ${{ matrix.image }}
+          package-type: container
+          min-versions-to-keep: 3

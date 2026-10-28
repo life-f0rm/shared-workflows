@@ -1,0 +1,224 @@
+---
+name: collection-ci
+
+on:
+  workflow_call:
+    inputs:
+      app-client-id:
+        type: string
+        default: ""
+      private-collections:
+        type: string
+        default: ""
+      python-version:
+        type: string
+        default: "3.14"
+      # ansible-test needs the ansible_collections layout; false for a repository without it.
+      sanity:
+        type: boolean
+        default: true
+      # `make test-python` runs plain pytest tests outside ansible-test.
+      python-tests:
+        type: boolean
+        default: false
+      # A JSON list. Each scenario runs as its own job; `molecule` passes when
+      # all of them do. Empty: every extensions/molecule/*/molecule.yml that
+      # does not bring its own driver (those are the Vagrant VMs).
+      molecule-scenarios:
+        type: string
+        default: ""
+      # auto: a pull request, selected from its diff. fast: everything but
+      # Molecule. full: everything.
+      mode:
+        type: string
+        default: auto
+    secrets:
+      app-private-key:
+        required: false
+    outputs:
+      mode:
+        value: ${{ jobs.changes.outputs.mode }}
+
+permissions:
+  contents: read
+
+env:
+  UV_PYTHON: ${{ inputs.python-version }}
+
+jobs:
+  changes:
+    timeout-minutes: 5
+    runs-on: ${{ (github.event.repository.private || github.event_name == 'schedule') && vars.PRIVATE_RUNNER || 'ubuntu-latest' }}
+    outputs:
+      mode: ${{ steps.select.outputs.mode }}
+      scenarios: ${{ steps.select.outputs.scenarios }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Select what this run needs
+        id: select
+        env:
+          MODE: ${{ inputs.mode }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          SCENARIOS: ${{ inputs.molecule-scenarios }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SCENARIOS}" ]; then
+            all=$(jq -c . <<< "${SCENARIOS}")
+          else
+            all=$(for file in extensions/molecule/*/molecule.yml; do
+                    if [ -f "${file}" ] && ! grep -q '^driver:' "${file}"; then
+                      basename "$(dirname "${file}")"
+                    fi
+                  done | jq -Rcs 'split("\n") | map(select(length > 0))')
+          fi
+
+          # Writes the decision as job outputs: a mode and a JSON list of scenarios.
+          emit() {
+            echo "mode=$1" >> "${GITHUB_OUTPUT}"
+            echo "scenarios=$2" >> "${GITHUB_OUTPUT}"
+            echo "mode: $1, scenarios: $2"
+          }
+
+          # Files that need lint and nothing else.
+          lint_only() {
+            [[ $1 =~ (\.md$|^docs/|^license$|^LICENSE$|^\.markdownlint|^\.pre-commit-config\.yaml$|^(\.github/)?renovate\.json$|^\.gitignore$|^\.gitleaks\.toml$) ]]
+          }
+
+          # The scenarios a role change needs: default, the role's own and its variants (kea_dhcp_*).
+          scenarios_for_role() {
+            jq -c --arg role "$1" '[.[] | select(. == "default" or . == $role or startswith($role + "_"))]' <<< "${all}"
+          }
+
+          # A pull request: lint alone for lint-only files; otherwise the scenarios of the touched
+          # roles or scenario directories, and every scenario for anything else.
+          select_from_diff() {
+            local mode=lint selected='[]' file
+            while IFS= read -r file; do
+              if [ -z "${file}" ] || lint_only "${file}"; then
+                continue
+              fi
+              mode=full
+              if [[ ${file} =~ ^roles/([^/]+)/ ]]; then
+                selected=$(jq -c --argjson add "$(scenarios_for_role "${BASH_REMATCH[1]}")" '. + $add' <<< "${selected}")
+              elif [[ ${file} =~ ^extensions/molecule/([^/]+)/ ]] && jq -e --arg s "${BASH_REMATCH[1]}" 'index($s)' <<< "${all}" > /dev/null; then
+                selected=$(jq -c --arg s "${BASH_REMATCH[1]}" '. + [$s]' <<< "${selected}")
+              else
+                selected=${all}
+                break
+              fi
+            done < <(git diff --name-only "${BASE}...${HEAD}")
+            if [ "${mode}" = lint ]; then
+              emit lint '[]'
+            elif [ "${selected}" = '[]' ]; then
+              emit full "${all}"
+            else
+              emit full "$(jq -c --argjson all "${all}" '$all - ($all - .)' <<< "${selected}")"
+            fi
+          }
+
+          case "${MODE}" in
+            fast) emit fast '[]' ;;
+            full) emit full "${all}" ;;
+            auto)
+              if [ "${DRAFT}" = true ]; then
+                emit skip '[]'
+              elif [[ ${HEAD_REF} == release-please--* ]]; then
+                emit lint '[]'
+              else
+                select_from_diff
+              fi
+              ;;
+            *) echo "::error::unknown mode ${MODE}"; exit 1 ;;
+          esac
+
+  # The commit stage in one job: Trivy on the clean checkout, then lint and the build, the Python
+  # tests and ansible-test, each when the mode asks for it.
+  checks:
+    needs: changes
+    if: needs.changes.outputs.mode != 'skip'
+    timeout-minutes: 45
+    runs-on: ${{ (github.event.repository.private || github.event_name == 'schedule') && vars.PRIVATE_RUNNER || 'ubuntu-latest' }}
+    env:
+      MODE: ${{ needs.changes.outputs.mode }}
+    steps:
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Trivy
+        if: contains(fromJSON('["full", "fast"]'), env.MODE)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          cache-dir: ${{ runner.temp }}/trivy
+      - &app-token
+        name: Create a GitHub App token for private sessrumnir collections
+        id: app
+        if: inputs.private-collections != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          repositories: ${{ inputs.private-collections }}
+          permission-contents: read
+      - &clone-with-token
+        name: Clone sessrumnir collections with the App token
+        if: steps.app.outputs.token != ''
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+        run: >-
+          git config --global
+          url."https://x-access-token:${APP_TOKEN}@github.com/sessrumnir/".insteadOf
+          "https://github.com/sessrumnir/"
+      - if: runner.environment == 'github-hosted'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Lint and build
+        run: make lint build
+      - name: Python tests
+        if: inputs.python-tests && contains(fromJSON('["full", "fast"]'), env.MODE)
+        run: make test-python
+      - name: ansible-test
+        if: inputs.sanity && contains(fromJSON('["full", "fast"]'), env.MODE)
+        run: |
+          make test-tree
+          export PATH="${PWD}/.venv/bin:${PATH}"
+          cd "$(find .ansible/test/ansible_collections -mindepth 2 -maxdepth 2 -type d | head -n 1)"
+          ansible-test sanity --docker
+          if [ -d tests/unit ]; then ansible-test units --docker; fi
+          if [ -d tests/integration ]; then ansible-test integration --docker; fi
+
+  # The acceptance stage: one job per selected scenario.
+  molecule-scenario:
+    name: molecule (${{ matrix.scenario }})
+    needs: [changes, checks]
+    if: >-
+      !cancelled() && !failure()
+      && needs.changes.outputs.mode == 'full'
+      && needs.changes.outputs.scenarios != '[]'
+    timeout-minutes: 75
+    runs-on: ${{ (github.event.repository.private || github.event_name == 'schedule') && vars.PRIVATE_RUNNER || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(needs.changes.outputs.scenarios) }}
+    steps:
+      - *checkout
+      - *app-token
+      - *clone-with-token
+      - run: make test SCENARIO="${SCENARIO}"
+        env:
+          SCENARIO: ${{ matrix.scenario }}

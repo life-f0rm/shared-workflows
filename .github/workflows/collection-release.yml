@@ -1,0 +1,88 @@
+---
+name: collection-release
+
+on:
+  workflow_call:
+    inputs:
+      app-client-id:
+        type: string
+        required: true
+      private-collections:
+        type: string
+        default: ""
+      python-version:
+        type: string
+        default: "3.14"
+    secrets:
+      app-private-key:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  UV_PYTHON: ${{ inputs.python-version }}
+
+jobs:
+  release-please:
+    timeout-minutes: 10
+    runs-on: ${{ (github.event.repository.private || github.event_name == 'schedule') && vars.PRIVATE_RUNNER || 'ubuntu-latest' }}
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-workflows: write
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          token: ${{ steps.app.outputs.token }}
+
+  artifact:
+    needs: release-please
+    if: needs.release-please.outputs.created == 'true'
+    timeout-minutes: 30
+    runs-on: ${{ (github.event.repository.private || github.event_name == 'schedule') && vars.PRIVATE_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-please.outputs.tag }}
+      - name: Create a GitHub App token for private sessrumnir collections
+        id: app
+        if: inputs.private-collections != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          repositories: ${{ inputs.private-collections }}
+          permission-contents: read
+      - name: Clone sessrumnir collections with the App token
+        if: steps.app.outputs.token != ''
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+        run: >-
+          git config --global
+          url."https://x-access-token:${APP_TOKEN}@github.com/sessrumnir/".insteadOf
+          "https://github.com/sessrumnir/"
+      - run: make build
+      - run: sha256sum .ansible/dist/*.tar.gz > .ansible/dist/SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: ${{ !github.event.repository.private }}
+        with:
+          subject-path: .ansible/dist/*.tar.gz
+      - run: gh release upload "${TAG}" .ansible/dist/*.tar.gz .ansible/dist/SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag }}

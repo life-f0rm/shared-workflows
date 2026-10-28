@@ -1,0 +1,85 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":semanticCommits"
+  ],
+  "labels": ["dependencies"],
+  "minimumReleaseAge": "3 days",
+  "schedule": ["before 6am on monday"],
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "schedule": ["at any time"],
+    "minimumReleaseAge": "0 days",
+    "automerge": true
+  },
+  "platformAutomerge": false,
+  "pre-commit": {
+    "enabled": true
+  },
+  "pip_requirements": {
+    "enabled": false
+  },
+  "pip-compile": {
+    "managerFilePatterns": ["/^requirements(-importer)?\\.txt$/"]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Own collections installed from git (source: git+https://…, type: git): the ansible-galaxy manager cannot update them",
+      "managerFilePatterns": ["/(^|/)requirements\\.ya?ml$/"],
+      "matchStrings": [
+        "source: git\\+https://github\\.com/(?<depName>sessrumnir/[\\w.-]+?)(?:\\.git)?\\n\\s+type: git\\n\\s+version: (?<currentValue>\\S+)"
+      ],
+      "datasourceTemplate": "github-tags"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "matchManagers": ["pip-compile", "pep621"],
+      "groupName": "python tooling"
+    },
+    {
+      "description": "Pre-commit hooks release several times a day: one grouped PR per repository in the weekly window",
+      "matchManagers": ["pre-commit"],
+      "groupName": "pre-commit hooks"
+    },
+    {
+      "description": "Own collections installed from git: the regex manager handles them",
+      "matchManagers": ["ansible-galaxy"],
+      "matchPackageNames": ["/^git\\+https://github\\.com/sessrumnir//"],
+      "enabled": false
+    },
+    {
+      "description": "Own collections flow as soon as they are released, all of a repository's collection pins in one pull request",
+      "matchDatasources": ["github-tags"],
+      "matchPackageNames": ["sessrumnir/ansible-*"],
+      "groupName": "sessrumnir collections",
+      "minimumReleaseAge": "0 days",
+      "schedule": ["at any time"]
+    },
+    {
+      "matchDepNames": ["sessrumnir/shared-workflows"],
+      "minimumReleaseAge": "0 days",
+      "schedule": ["at any time"]
+    },
+    {
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "automerge": true
+    },
+    {
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "A shared-workflow bump that cannot start (an action the organization does not allow) creates no check runs, which Renovate takes as green: these are merged by hand",
+      "matchDepNames": ["sessrumnir/shared-workflows"],
+      "automerge": false
+    }
+  ]
+}

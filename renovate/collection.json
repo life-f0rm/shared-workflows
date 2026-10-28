@@ -1,0 +1,29 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["local>sessrumnir/shared-workflows//renovate/default"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^roles/[^/]+/defaults/main\\.yml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+) currentValue=(?<currentValue>\\S+)\\n\\S+_digest: \"(?<currentDigest>sha256:[a-f0-9]{64})\""
+      ],
+      "versioningTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^extensions/molecule/(.+/molecule|config)\\.yml$/"],
+      "matchStrings": [
+        "image: (?<depName>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker",
+      "currentValueTemplate": "latest"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchFileNames": ["roles/**"],
+      "semanticCommitType": "fix"
+    }
+  ]
+}
